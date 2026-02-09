@@ -2385,26 +2385,54 @@ def send_email_graph(
     plain_text_body: Optional[str] = None,
 ) -> bool:
     """
-    Send email - tries SMTP (Gmail) first, falls back to Microsoft Graph API.
+    Send email using Microsoft Graph API (preferred), with optional SMTP fallback.
 
-    Args:
-        plain_text_body: For HTML emails, include plain text version for multipart/alternative
-
-    Args:
-        subject: Email subject line
-        body: Email body (plain text or HTML)
-        to_emails: List of recipient email addresses
-        cc_emails: Optional list of CC recipients
-        attachment: Optional attachment dict with filename, data, maintype, subtype
-        content_type: "Text" for plain text, "HTML" for HTML emails
+    Why Graph-first:
+      - Avoids noisy SMTP auth errors when SMTP secrets are present but invalid.
+      - Aligns with the app's primary delivery mechanism (Microsoft 365).
     """
     # Validate recipients before attempting to send
-    valid_recipients = [e for e in to_emails if e and e.strip()]
+    valid_recipients = [e for e in (to_emails or []) if e and e.strip()]
     if not valid_recipients:
         st.error("At least one recipient email is required to send an email.")
         return False
 
-    # Try SMTP first (Gmail)
+    valid_cc = [e for e in (cc_emails or []) if e and e.strip()] or None
+
+    # 1) Prefer Graph API
+    cfg = get_graph_config()
+    if cfg:
+        try:
+            client = GraphClient(cfg)
+
+            graph_attachment = None
+            if attachment:
+                graph_attachment = {
+                    "name": attachment.get("filename", "attachment.bin"),
+                    "contentBytes": attachment.get("data"),
+                    "contentType": f"{attachment.get('maintype', 'application')}/{attachment.get('subtype', 'octet-stream')}",
+                }
+
+            client.send_mail(
+                subject=subject,
+                body=body,
+                to_recipients=valid_recipients,
+                cc_recipients=valid_cc,
+                content_type=content_type,
+                attachment=graph_attachment,
+            )
+
+            format_info = "(HTML)" if content_type.upper() == "HTML" else "(plain text)"
+            st.success(f"Email sent via Microsoft Graph {format_info}")
+            return True
+        except Exception as e:
+            log_structured(
+                LogLevel.WARNING,
+                f"Graph email send failed, will try SMTP if configured: {e}",
+                action="graph_send_fallback",
+            )
+
+    # 2) Optional SMTP fallback
     smtp_cfg = _smtp_cfg()
     if smtp_cfg:
         try:
@@ -2423,39 +2451,15 @@ def send_email_graph(
                 return True
         except Exception as e:
             log_structured(
-                LogLevel.WARNING,
-                f"SMTP send failed, will try Graph API: {e}",
-                action="smtp_send_fallback",
+                LogLevel.ERROR,
+                f"SMTP send failed: {e}",
+                action="smtp_send",
+                error_type=type(e).__name__,
+                exc_info=True,
             )
 
-    # Fall back to Graph API
-    cfg = get_graph_config()
-    if not cfg:
-        st.warning("Neither SMTP nor Graph API is configured for sending emails.")
-        return False
-
-    try:
-        client = GraphClient(cfg)
-        graph_attachment = None
-        if attachment:
-            graph_attachment = {
-                "name": attachment.get("filename", "attachment.bin"),
-                "contentBytes": attachment.get("data"),
-                "contentType": f"{attachment.get('maintype', 'application')}/{attachment.get('subtype', 'octet-stream')}",
-            }
-        client.send_mail(
-            subject=subject,
-            body=body,
-            to_recipients=valid_recipients,
-            cc_recipients=[e for e in (cc_emails or []) if e and e.strip()] or None,
-            content_type=content_type,
-            attachment=graph_attachment,
-        )
-        return True
-    except Exception as e:
-        st.error(f"Graph email send failed: {e}")
-        return False
-
+    st.warning("Neither Graph API nor SMTP was able to send the email.")
+    return False
 
 def fetch_emails_imap(include_read: bool = False, limit: int = 20) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
     """
@@ -5974,7 +5978,7 @@ def _create_individual_invite(
     )
 
     try:
-        created = client.create_event(payload)
+        created = client.create_event(payload, send_updates="all")
         event_id = created.get("id", "")
         teams_url = ""
         warnings: List[str] = []
@@ -6335,7 +6339,7 @@ def _create_group_invite(
     )
 
     try:
-        created = client.create_event(payload)
+        created = client.create_event(payload, send_updates="all")
         event_id = created.get("id", "")
         teams_url = ""
         warnings: List[str] = []
@@ -6687,7 +6691,7 @@ def _handle_create_invite(
     )
 
     try:
-        created = client.create_event(payload)
+        created = client.create_event(payload, send_updates="all")
         event_id = created.get("id", "")
         teams_url = ""
         if is_teams:
