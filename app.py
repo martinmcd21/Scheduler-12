@@ -2621,6 +2621,7 @@ def fetch_emails_imap(include_read: bool = False, limit: int = 20) -> Tuple[List
                     "body": preview_body,  # Truncated for display
                     "full_body": full_body,  # Full body for slot detection
                     "is_read": is_read,
+                    "source": "imap",
                 })
             except Exception as e:
                 # Skip problematic messages
@@ -2712,6 +2713,28 @@ def mark_email_read_imap(msg_id: str) -> bool:
         socket.setdefaulttimeout(None)
 
 
+def mark_email_read_graph(message_id: str) -> bool:
+    """
+    Mark an email as read via Microsoft Graph.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        cfg = get_graph_config()
+        if not cfg:
+            return False
+        from graph_client import GraphClient
+        client = GraphClient(cfg)
+        client.mark_message_read(message_id)
+        return True
+    except Exception as e:
+        log_structured(
+            LogLevel.WARNING,
+            f"Failed to mark Graph message as read: {e}",
+            action="mark_email_read_graph",
+            error_type=type(e).__name__,
+        )
+        return False
+
 def fetch_unread_emails_graph(include_read: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
     """
     Fetch emails from scheduler mailbox via Microsoft Graph API.
@@ -2764,6 +2787,7 @@ def fetch_unread_emails_graph(include_read: bool = False) -> Tuple[List[Dict[str
                 "body": preview_body,  # Truncated for display
                 "full_body": full_body,  # Full body for slot detection
                 "is_read": msg.get("isRead", False),
+                "source": "graph",
             })
 
         return emails, None, True  # Success, configured
@@ -2834,24 +2858,100 @@ def _extract_slots_from_email_body(text: str) -> List[Dict[str, str]]:
 
 
 
+def _extract_reply_top(text: str, max_lines: int = 25) -> str:
+    """
+    Best-effort extraction of the candidate's *new reply* content from an email body.
+    We take the content above common quote markers (Gmail/Outlook) and only keep the first few lines.
+    This avoids matching numbers embedded in the quoted scheduling email (slot list, dates, etc.).
+    """
+    if not text:
+        return ""
+
+    t = str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+    # Common "quoted message" markers (Outlook/Gmail/etc.)
+    quote_markers = [
+        r"(?im)^\s*On\s.+?wrote:\s*$",
+        r"(?im)^\s*From:\s.+$",
+        r"(?im)^\s*Sent:\s.+$",
+        r"(?im)^\s*To:\s.+$",
+        r"(?im)^\s*Subject:\s.+$",
+        r"(?im)^\s*-{2,}\s*Original Message\s*-{2,}\s*$",
+        r"(?im)^\s*_{5,}\s*$",
+    ]
+
+    cut_at = None
+    for pat in quote_markers:
+        m = re.search(pat, t)
+        if m:
+            cut_at = m.start() if cut_at is None else min(cut_at, m.start())
+
+    if cut_at is not None:
+        t = t[:cut_at]
+
+    # Remove lines that are just quoting indicators
+    lines = []
+    for line in t.split("\n"):
+        if line.strip().startswith(">"):
+            continue
+        lines.append(line)
+
+    # Keep only the top part (reply is usually at the top)
+    top = "\n".join(lines).strip()
+
+    # Stop at signature delimiter if present
+    sig_idx = top.find("\n--\n")
+    if sig_idx != -1:
+        top = top[:sig_idx].strip()
+
+    # Return first N non-empty lines
+    kept = []
+    for line in top.split("\n"):
+        if line.strip():
+            kept.append(line.strip())
+        if len(kept) >= max_lines:
+            break
+    return "\n".join(kept).strip()
+
+
 def detect_slot_choice_from_text(text, slots):
+    """
+    Detect a slot choice in a candidate reply.
+
+    Supports:
+      - Bare numbers like "1" / "#1"
+      - "Option 2", "Slot 3", "Choice 1"
+      - "I pick 2" / "I choose 3"
+    We intentionally only scan the *reply top* portion of the message to avoid
+    matching numbers in the quoted original scheduling email.
+    """
     import re
 
-    t = (text or "").strip()
+    if not slots:
+        return None
 
-    # EARLY EXIT: handle replies like "3"
-    bare = re.fullmatch(r"\s*(\d{1,3})\s*", t)
-    if bare:
-        slot_num = int(bare.group(1))
-        if slots and 1 <= slot_num <= len(slots):
+    reply_top = _extract_reply_top(text or "")
+
+    # 1) Standalone number on a line (common: candidate replies "1")
+    m = re.search(r"(?m)^\s*#?\s*(\d{1,3})\s*$", reply_top)
+    if m:
+        slot_num = int(m.group(1))
+        if 1 <= slot_num <= len(slots):
             return slots[slot_num - 1]
 
-    lower = t.lower()
-    for idx, slot in enumerate(slots, start=1):
-        if f"slot {idx}" in lower:
-            return slot
-        if f"option {idx}" in lower:
-            return slot
+    # 2) Explicit phrasing: "slot 2", "option 3", "choice 1"
+    m = re.search(r"(?i)\b(?:slot|option|choice)\s*#?\s*(\d{1,3})\b", reply_top)
+    if m:
+        slot_num = int(m.group(1))
+        if 1 <= slot_num <= len(slots):
+            return slots[slot_num - 1]
+
+    # 3) Natural language: "I pick 2", "I choose 1", "select 3"
+    m = re.search(r"(?i)\b(?:pick|choose|select)\b\D{0,10}(\d{1,3})\b", reply_top)
+    if m:
+        slot_num = int(m.group(1))
+        if 1 <= slot_num <= len(slots):
+            return slots[slot_num - 1]
 
     return None
 
@@ -4340,9 +4440,37 @@ def main() -> None:
             # Helper function to send invite for a detected slot
             def _send_invite_for_email(email_data: Dict[str, Any], detected_slot: Dict[str, str]) -> bool:
                 """Send calendar invite for a detected slot choice. Returns True on success."""
-                cand_email = email_data.get("from", "")
+                cand_email = (email_data.get("from", "") or "").strip()
 
-                # Get current form values from session state (keys match form input keys)
+                # Prefer candidate info from the UI (New Scheduling Request tab) when available.
+                # This matters if the "from" address is an alias or differs from the one entered.
+                try:
+                    candidate_results = parse_candidate_emails(st.session_state.get("multi_cand_input", ""))
+                    valid_candidates = [r for r in candidate_results if getattr(r, "is_valid", False)]
+                except Exception:
+                    valid_candidates = []
+
+                # If the email sender matches a known candidate, use that record (for name + email).
+                matched = None
+                for c in valid_candidates:
+                    if (getattr(c, "email", "") or "").strip().lower() == cand_email.lower():
+                        matched = c
+                        break
+
+                # If no match, but exactly one candidate in the UI, fall back to that.
+                if matched is None and len(valid_candidates) == 1:
+                    matched = valid_candidates[0]
+                    if not cand_email:
+                        cand_email = (matched.email or "").strip()
+
+                # Resolve candidate display name (best effort)
+                candidate_name = ""
+                if matched is not None:
+                    candidate_name = getattr(matched, "name", "") or ""
+                    if not cand_email:
+                        cand_email = (matched.email or "").strip()
+
+                # Get current form values from session state (keys match form input keys) from session state (keys match form input keys)
                 hm_email = st.session_state.get("hm_email", "")
                 hm_name = st.session_state.get("hm_name", "")
                 rec_email = st.session_state.get("rec_email", "")
@@ -4364,7 +4492,7 @@ def main() -> None:
                     return False
 
                 # Parse candidate name from email if possible
-                candidate_name = _ensure_candidate_name("", cand_email)
+                candidate_name = _ensure_candidate_name(candidate_name, cand_email)
 
                 # Create the invite
                 result = _create_individual_invite(
@@ -4392,7 +4520,10 @@ def main() -> None:
                     # Mark email as read after successful invite
                     email_id = email_data.get("id", "")
                     if email_id:
-                        mark_email_read_imap(email_id)
+                        if email_data.get("source") == "graph":
+                            mark_email_read_graph(email_id)
+                        else:
+                            mark_email_read_imap(email_id)
                     return True
                 else:
                     st.error(f"Failed to send invite to {cand_email}: {result.error}")
