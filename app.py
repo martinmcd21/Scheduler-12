@@ -2762,6 +2762,12 @@ def fetch_unread_emails_graph(include_read: bool = False) -> Tuple[List[Dict[str
                 email_addr = from_data.get("emailAddress", {})
                 from_addr = email_addr.get("address", "")
 
+            # Skip messages sent from the scheduler mailbox itself (e.g., outbound scheduling emails
+            # copied into the inbox). We only want inbound candidate replies here.
+            scheduler_addr = (cfg.scheduler_mailbox or "").strip().lower()
+            if scheduler_addr and (from_addr or "").strip().lower() == scheduler_addr:
+                continue
+
             # Get body content (prefer text, fall back to HTML)
             body_content = msg.get("bodyPreview", "")
             body_data = msg.get("body", {})
