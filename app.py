@@ -2847,6 +2847,20 @@ def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Opti
     """
     t = (text or "").strip()
 
+# ------------------------------------------------------------
+# EARLY EXIT: if the entire email body is just a number like "3"
+# (common on mobile / Outlook quick replies)
+# ------------------------------------------------------------
+bare = re.fullmatch(r"\s*(\d{1,3})\s*", t)
+if bare:
+    try:
+        slot_num = int(bare.group(1))
+        if slots and 1 <= slot_num <= len(slots):
+            return slots[slot_num - 1]
+    except Exception:
+        pass
+
+
     # Try to extract slots from the email body (quoted original email)
     # This is more reliable than session state which may have changed
     email_slots = _extract_slots_from_email_body(t)
