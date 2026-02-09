@@ -2833,25 +2833,20 @@ def _extract_slots_from_email_body(text: str) -> List[Dict[str, str]]:
     return slots
 
 
-def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+
+def detect_slot_choice_from_text(text, slots):
     import re
 
     t = (text or "").strip()
 
-    # ------------------------------------------------------------
     # EARLY EXIT: handle replies like "3"
-    # ------------------------------------------------------------
     bare = re.fullmatch(r"\s*(\d{1,3})\s*", t)
     if bare:
         slot_num = int(bare.group(1))
         if slots and 1 <= slot_num <= len(slots):
             return slots[slot_num - 1]
 
-    # ------------------------------------------------------------
-    # Existing logic continues below
-    # ------------------------------------------------------------
     lower = t.lower()
-
     for idx, slot in enumerate(slots, start=1):
         if f"slot {idx}" in lower:
             return slot
@@ -2859,63 +2854,7 @@ def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Opti
             return slot
 
     return None
-    
-    # Method 1: Look for slot number at the START of the reply (before quoted text)
-    # Email replies typically have the response at the top, then "On ... wrote:" and quoted text
-    # Extract just the reply part (before "On " or ">")
-    reply_text = t
 
-    # Split on common reply markers
-    for marker in ["\nOn ", "\n>", "\r\n>", "On Mon,", "On Tue,", "On Wed,", "On Thu,", "On Fri,", "On Sat,", "On Sun,"]:
-        if marker in reply_text:
-            reply_text = reply_text.split(marker)[0]
-            break
-
-    reply_text = reply_text.strip()
-
-    # Look for slot number (1-3 digits to support up to 999 slots)
-    slot_num_patterns = [
-        r"^\s*(\d{1,3})\s*$",  # Just a number like "3" or "70" or "252"
-        r"^\s*(\d{1,3})\s*[\n\r.,!]",  # Number at start followed by newline or punctuation
-        r"^\s*(\d{1,3})\b",  # Number at the very start
-        r"(?:slot|option|choice|number|#)\s*(\d{1,3})\b",  # "slot 70", "#70", etc.
-        r"\b(\d{1,3})\s*(?:st|nd|rd|th)?\s*(?:slot|option|choice)",  # "70th slot"
-    ]
-
-    for pattern in slot_num_patterns:
-        match = re.search(pattern, reply_text, re.IGNORECASE)
-        if match:
-            try:
-                slot_num = int(match.group(1))
-                if 1 <= slot_num <= len(effective_slots):
-                    return effective_slots[slot_num - 1]  # Convert to 0-indexed
-            except (ValueError, IndexError):
-                pass
-
-    # Method 2: Look for full slot label in text
-    t_lower = t.lower()
-    for s in effective_slots:
-        label = format_slot_label(s).lower()
-        if label in t_lower:
-            return s
-
-    # Method 3: Look for date and time that match a slot
-    # Only match if the date+time actually corresponds to one of our slots
-    m_date = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", reply_text)
-    m_time = re.search(r"\b(\d{1,2}:\d{2})\b", reply_text)
-    if m_date and m_time:
-        date = m_date.group(1)
-        start = m_time.group(1).zfill(5)
-        for s in effective_slots:
-            if s.get("date") == date and s.get("start") == start:
-                return s
-
-    return None
-
-
-# ----------------------------
-# Graph + ICS helpers
-# ----------------------------
 def _make_graph_client() -> Optional[GraphClient]:
     cfg = get_graph_config()
     if not cfg:
