@@ -2834,43 +2834,32 @@ def _extract_slots_from_email_body(text: str) -> List[Dict[str, str]]:
 
 
 def detect_slot_choice_from_text(text: str, slots: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    """
-    Detect which slot the candidate chose from their reply.
+    import re
 
-    Handles:
-    1. Simple slot numbers: "3", "70", "slot 3", "#3", "option 3"
-    2. Full slot labels: "2026-01-26 01:00-01:30"
-    3. Date + time mentions
-
-    If the email body contains numbered slots (from the quoted original email),
-    those are extracted and used instead of the session state slots.
-    """
     t = (text or "").strip()
 
-# ------------------------------------------------------------
-# EARLY EXIT: if the entire email body is just a number like "3"
-# (common on mobile / Outlook quick replies)
-# ------------------------------------------------------------
-bare = re.fullmatch(r"\s*(\d{1,3})\s*", t)
-if bare:
-    try:
+    # ------------------------------------------------------------
+    # EARLY EXIT: handle replies like "3"
+    # ------------------------------------------------------------
+    bare = re.fullmatch(r"\s*(\d{1,3})\s*", t)
+    if bare:
         slot_num = int(bare.group(1))
         if slots and 1 <= slot_num <= len(slots):
             return slots[slot_num - 1]
-    except Exception:
-        pass
 
+    # ------------------------------------------------------------
+    # Existing logic continues below
+    # ------------------------------------------------------------
+    lower = t.lower()
 
-    # Try to extract slots from the email body (quoted original email)
-    # This is more reliable than session state which may have changed
-    email_slots = _extract_slots_from_email_body(t)
+    for idx, slot in enumerate(slots, start=1):
+        if f"slot {idx}" in lower:
+            return slot
+        if f"option {idx}" in lower:
+            return slot
 
-    # Use email slots if we found them and they have more slots than session state
-    effective_slots = email_slots if len(email_slots) > len(slots or []) else (slots or [])
-
-    if not effective_slots:
-        return None
-
+    return None
+    
     # Method 1: Look for slot number at the START of the reply (before quoted text)
     # Email replies typically have the response at the top, then "On ... wrote:" and quoted text
     # Extract just the reply part (before "On " or ">")
